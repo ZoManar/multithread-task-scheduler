@@ -11,6 +11,8 @@
 #include <optional>
 #include <random>
 #include <algorithm>
+#include <chrono>
+#include <array>
 using namespace std;
 
 // _____Priority______________________________________________________________________
@@ -25,93 +27,87 @@ struct Task {
     Priority priority;
     int arrival_sequence;
     function<void()> work;
-    
-    // higher priority stays at back of deque
-    bool operator<(const Task& other) const {
-        if (priority == other.priority)
-            return arrival_sequence> other.arrival_sequence;
-        return priority < other.priority;
-    }
 };
 
-// _____Work stealing deque___________________________________________________________
-class PriorityDeque {
+// ___BucketedPriorityDeque___________________________________________________________
+class BucketedPriorityDeque{
 private:
-    deque<Task> items;
-    mutable mutex m ;
-
-    //insert task in sorted position - keep deque orderd
-    void sorted_insert(Task task) {
-        // find correct position using binary search logic 
-        // it is an iterator points to the correct insertion position.
-        auto it = lower_bound(items.begin(), items.end(), task, [](const Task& a, const Task& b) {
-            return a < b; 
-        }
-    );
-    items.insert(it, std::move(task));
+    // one deque per priority level (indexed by priorities, low=0, normal=1, high=2)
+    array<deque<Task>, 3> buckets; 
+    mutable mutex m;
+    size_t total_size = 0;
+    static int idx(Priority p) {
+        return static_cast<int>(p);
     }
-    
+
 public:
-    // owner pushes in sorted order
-    void push(Task& task){
+    // append to correct bucket O(1)
+    void push(Task task){
         lock_guard<mutex> lock(m);
-        sorted_insert(std::move(task));
+        int i = idx(task.priority);
+        buckets[i].push_back(std::move(task));
+        total_size++;
     }
 
-    // owner pops highest priority from back 
     optional<Task> pop_back() {
         lock_guard<mutex> lock(m);
-        if (items.empty()) return nullopt;
-        Task task = std::move(items.back());
-        items.pop_back(); // removes the empty shell
-        return task;
+        // pop from highest non empty bucket
+        for (int i = 2; i >= 0; i--){
+            if (!buckets[i].empty()){
+                Task t = std::move(buckets[i].back());
+                buckets[i].pop_back();
+                total_size--;
+                return t;
+            }
+        }
+        return nullopt;
     }
 
-    // steal lowest priority from front 
     optional<Task> steal_front() {
         lock_guard<mutex> lock(m);
-        if (items.empty()) return std::nullopt;
-        Task task = std::move(items.front());
-        items.pop_front();
-        return task;
-    }
 
+        for (int i = 0; i <= 2; i++){
+            if (!buckets[i].empty()){
+                Task t = std::move(buckets[i].front());
+                buckets[i].pop_front();
+                total_size--;
+                return t;
+            }
+        }
+        return nullopt;
+    }
+    
     bool empty() const{
         lock_guard<mutex> lock(m);
-        return items.empty();
+        return total_size == 0;
     }
 
     size_t size() const {
         lock_guard<mutex> lock(m);
-        return items.size();
+        return total_size;
     }
+
 };
 
-class ThreadPool{
+
+class ThreadPool {
 private:
     struct Worker{
     // each worker owns its deque and knows about all other workers
-        PriorityDeque deque;
+        BucketedPriorityDeque deque;
         thread t;
+        mutex cv_m;
+        condition_variable cv;
+        int id = 0;
     };
+    
 
     vector<unique_ptr<Worker>> workers;
-    mutex global_m;
-    condition_variable global_cv;
     atomic<bool> stop_flag{false};
     atomic<int> next_worker{0};
     atomic<int> id_generator{0};
 
-    // check if any queue has tasks
-    bool has_any_tasks() const{
-        for (auto& w : workers)
-            if (!w -> deque.empty()) 
-                return true;
-            
-            return false;
-    }
-
-    optional<function<void()>> try_steal(int my_id){
+    optional<Task> try_steal(int my_id){
         int n = workers.size();
         
         // first try steal from busiest
@@ -126,70 +122,84 @@ private:
             }
         }    
 
-        if (busiest_id >= 0 && max_size > 1){
+        if (busiest_id >= 0 && max_size > 0){
             auto task = workers[busiest_id]->deque.steal_front();
             if (task) return task;
         }
         // random sweep if busiest attempt failed
-        int start = rand() % n;
-        for (int i = 0; i < n; i++){
-            int target = (start + i) % n;
-            if(target == my_id) continue;
-            auto task = workers[target]->deque.steal_front();
-            if (task) return task;
+        for (int i = 0; i < n; i++) {
+            int target = (my_id + 1 + i) % n;
+            if (target == my_id) continue;
+            auto t = workers[target]->deque.steal_front();
+            if (t) return t;
         }
         return std::nullopt;
     }
 
+    void run_task(int worker_id, Task task) {
+    try {
+            task.work();
+        } catch (const exception& e) {
+            cerr << "Worker " << worker_id
+                << " exception: " << e.what() << "\n";
+        } catch (...) {
+            cerr << "Worker " << worker_id
+                << " unknown exception\n";
+        }
+    }
 
     void worker_loop(int my_id){
+        Worker& me = *workers[my_id];
         while (true){
-            // check if my own queue has task
-            auto task = workers[my_id]->deque.pop_back();
+            while(true){
+                //drain own ququq before stealing
+                auto task = me.deque.pop_back();
+                if(!task) break;
+                run_task(my_id, std::move(*task));
 
-            // try stealing from others
-            if(!task){
-                task = try_steal(my_id);
+            }
+            
+            {
+                // try steal from busiest worker
+                auto task = try_steal(my_id);
+                if(task){
+                    run_task(my_id, std::move(*task));
+                    continue;
+                }
             }
 
-            // run the task if found
-            if(task){
-                try{
-                    task->work();
-                }catch (const exception& e) {
-                    cerr <<"Worker:  " << my_id << "exception: " << e.what() <<"\n";
-                }catch (...){
-                    cerr <<"Worker:  " << my_id << "unknown exception\n";
+            if(stop_flag.load()&& me.deque.empty()){
+
+                while (true)
+                {
+                    auto task = try_steal(my_id);
+                    if(!task) break;
+                    run_task(my_id, std::move(*task));
                 }
-                continue;
+                
+                return;
             }
 
             {
-                // nothing found - sleep
-                unique_lock<mutex> lock(global_m);
-                global_cv.wait_for(
+                unique_lock<mutex> lock(me.cv_m);
+                me.cv.wait_for(
                     lock,
-                    chrono::milliseconds(1),
-                    [this]{
-                        return stop_flag.load() || has_any_tasks();
+                    chrono::milliseconds(50),  // fallback for stealing
+                    [&] {
+                        return stop_flag.load() || !me.deque.empty();
                     }
                 );
-            
-            }
-            
-            if(stop_flag.load()&& !has_any_tasks()) return;
-
             }
         }
-
-public:
+    }
         
+public:
     explicit ThreadPool(int num_threads) {
         workers.reserve(num_threads);
 
         for (int i = 0; i < num_threads; i++){
             workers.push_back(make_unique<Worker>());
-
+            workers.back()->id = i;
             workers.back()->t = thread(
                 &ThreadPool::worker_loop, this, i
             );
@@ -198,7 +208,7 @@ public:
     }
 
     template<typename F> 
-    auto submit(F task, Priority piority = Priority::NORMAL,int preferred_worker = -1) -> future<decltype(task())>{
+    auto submit(F task, Priority priority = Priority::NORMAL,int preferred_worker = -1) -> future<decltype(task())>{
 
         using ReturnType = decltype(task());
 
@@ -224,7 +234,7 @@ public:
             id_generator.fetch_add(1),
             [pt](){ (*pt)(); }
         });
-        global_cv.notify_one();
+        workers[target]->cv.notify_one();
         return result;
     }
 
@@ -236,43 +246,53 @@ public:
             return;
         }
       
-        global_cv.notify_all();
         for (auto &w: workers){
+            {
+                w->cv.notify_all();
+            }
+        }
+
+        for(auto& w : workers)
             if (w->t.joinable()) w->t.join();
-        } 
     }
     
     ~ThreadPool(){
         shutdown();
-
     }
+
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
 };
 
 int main() {
-    ThreadPool pool(3);
+    ThreadPool pool(4);
 
+    const int NUM_TASKS = 100;
     vector<future<int>> futures;
+    futures.reserve(NUM_TASKS);
 
-    // mix of priorities — HIGH should complete before LOW
-    for (int i = 0; i < 5; i++) {
+    auto start = chrono::steady_clock::now();
+
+    for (int i = 0; i < NUM_TASKS; i++) {
+        Priority p = (i % 3 == 0) ? Priority::HIGH
+                   : (i % 3 == 1) ? Priority::NORMAL
+                                   : Priority::LOW;
         futures.push_back(pool.submit([i]() {
-            cout << "LOW task " << i << " on "
-                 << this_thread::get_id() << "\n";
-            return i;
-        }, Priority::LOW));
+            return i * i;
+        }, p));
     }
 
-    for (int i = 0; i < 5; i++) {
-        futures.push_back(pool.submit([i]() {
-            cout << "HIGH task " << i << " on "
-                 << this_thread::get_id() << "\n";
-            return i * 10;
-        }, Priority::HIGH));
-    }
+    int total = 0;
+    for (auto& f : futures) total += f.get();
 
-    for (auto& f : futures) f.get();
+    auto end = chrono::steady_clock::now();
+    auto ms  = chrono::duration_cast<chrono::milliseconds>
+               (end - start).count();
+
+    cout << "Completed " << NUM_TASKS << " tasks\n";
+    cout << "Total: "    << total     << "\n";
+    cout << "Time: "     << ms        << "ms\n";
+
     pool.shutdown();
 }
