@@ -17,6 +17,7 @@
 #include <string>
 #include <cassert>
 #include <climits>
+#include <map>
 using namespace std;
 
 // _____Priority______________________________________________________________________
@@ -34,6 +35,7 @@ struct Task {
     chrono::steady_clock::time_point submit_time = chrono::steady_clock::now(); // for latency measurement
 };
 
+/*
 //___Scheduler Stats___________________________________________________________________
 struct SchedulerStats
 {
@@ -114,8 +116,7 @@ struct SchedulerStats
     }
 
 };
-
-
+*/
 
 // ___BucketedPriorityDeque___________________________________________________________
 class BucketedPriorityDeque{
@@ -195,10 +196,6 @@ private:
     atomic<int> id_generator{0};
     atomic<int> total_tasks{0};     // tasks across ALL queues
 
-public:
-    SchedulerStats stats;
-   
-private:
     // ── stealing ─────────────────────────────────────────────────
     optional<Task> try_steal(int my_id){
         int n = workers.size();
@@ -249,12 +246,6 @@ private:
 
     // ── task execution ───────────────────────────────────────────
     void run_task(int worker_id, Task task) {
-        // record latency
-        auto now = chrono::steady_clock::now();
-        auto latency = chrono::duration_cast<chrono::microseconds>
-                        (now - task.submit_time).count();
-        stats.record_latency(latency);
-
         try {
                 task.work();
             } catch (const exception& e) {
@@ -278,8 +269,6 @@ private:
                 auto task = me.deque.pop_back();
                 if(!task) break;
                 total_tasks.fetch_sub(1); // decrement on pop
-                stats.tasks_executed.fetch_add(1);
-                stats.workers[my_id].tasks_executed.fetch_add(1);
                 run_task(my_id, std::move(*task));
             }
             
@@ -288,10 +277,6 @@ private:
                 // try steal from busiest worker
                 auto task = try_steal(my_id);
                 if(task){
-                    stats.tasks_executed.fetch_add(1);
-                    stats.tasks_stolen.fetch_add(1);
-                    stats.workers[my_id].tasks_executed.fetch_add(1);
-                    stats.workers[my_id].tasks_stolen.fetch_add(1);
                     run_task(my_id, std::move(*task));
                     continue;
                 }
@@ -304,10 +289,6 @@ private:
                 {
                     auto task = try_steal(my_id);
                     if (!task) break;
-                    stats.tasks_executed.fetch_add(1);
-                    stats.tasks_stolen.fetch_add(1);
-                    stats.workers[my_id].tasks_executed.fetch_add(1);
-                    stats.workers[my_id].tasks_stolen.fetch_add(1);
                     run_task(my_id, std::move(*task));
                 }
                 
@@ -318,7 +299,6 @@ private:
             {
                 unique_lock<mutex> lock(me.cv_m);
                 me.is_idle.store(true);
-                stats.workers[my_id].times_idle.fetch_add(1);
                 me.cv.wait(lock, [&] {
                     return stop_flag.load() 
                         || !me.deque.empty()
@@ -336,18 +316,17 @@ private:
     }
         
 public:
-    explicit ThreadPool(int num_threads)
-        : stats(num_threads) 
-    {
-        workers.reserve(num_threads);
-        for (int i = 0; i < num_threads; i++){
-            workers.push_back(make_unique<Worker>());
-            workers.back()->id = i;
-            workers.back()->t = thread(
-                &ThreadPool::worker_loop, this, i
-            );
-        }
+    explicit ThreadPool(int num_threads){
+    workers.reserve(num_threads);
+    for (int i = 0; i < num_threads; i++){
+        workers.push_back(make_unique<Worker>());
+        workers.back()->id = i;
+        workers.back()->t = thread(
+            &ThreadPool::worker_loop, this, i
+        );
     }
+}
+    
 
     // ── Submit ───────────────────────────────────────────────────
     template<typename F> 
@@ -379,8 +358,6 @@ public:
             chrono::steady_clock::now()
         });
         total_tasks.fetch_add(1);
-        stats.tasks_submitted.fetch_add(1);
-
         // notify target worker directly
         workers[target]->cv.notify_one();
 
@@ -419,6 +396,469 @@ public:
 
 };
 
+struct TaskNode{
+    string name;
+    int id = 0;
+    function<void()> work;
+    Priority priority = Priority::NORMAL;
+
+    atomic<int> dep_count{0};        // unfinished dependencies
+    vector<TaskNode*> dependents;   // tasks that depend on ME
+
+    enum class State {PENDING, READY, RUNNING, DONE };
+    atomic<State> state{State::PENDING};
+    shared_future<void> completion_future;
+
+private:
+    promise<void> completion_promise;
+
+public:
+    TaskNode(string n, function<void()> w, Priority p = Priority::NORMAL)
+        : name(std::move(n)) , work(std::move(w)) , priority(p)
+        {
+            completion_future = completion_promise.get_future().share();
+        }
+
+        void fulfill(exception_ptr ex = nullptr) {
+            if (ex)
+                completion_promise.set_exception(ex);
+            else
+                completion_promise.set_value();
+        }
+    
+        TaskNode(const TaskNode&) = delete;
+        TaskNode& operator=(const TaskNode&) = delete;
+};
+
+class DAGScheduler {
+private:
+    ThreadPool& pool;
+    vector<unique_ptr<TaskNode>> nodes; 
+    mutex graph_m;
+    atomic<int> node_id_counter{0};
+    atomic<int> pending_tasks{0};
+    mutex wait_m;
+    condition_variable all_done_cv;
+
+    // ── Cycle Detection ──────────────────────────────────────────
+    bool validate() {
+        enum class Color {WHITE, GRAY, BLACK };
+        map<TaskNode*, Color> color;
+        for (auto& n : nodes) color[n.get()] = Color::WHITE;
+
+        function<bool(TaskNode*)> dfs = [&](TaskNode* n ) -> bool {
+            color[n] = Color::GRAY;
+            for (TaskNode* dep : n->dependents) {
+                if (color[dep] == Color::GRAY) {
+                    cerr << "CYCLE: "
+                         << n->name << " ──► " << dep->name << "\n";
+                    return false;
+                }
+                
+                if (color[dep] == Color::WHITE)
+                    if (!dfs(dep)) return false;
+            }
+            color[n] = Color::BLACK;
+            return true;
+        };
+
+        for (auto& n : nodes)
+            if (color[n.get()] == Color::WHITE)
+                if (!dfs(n.get())) return false;
+        return true;
+    }
+
+    void activate(TaskNode* node) {
+        // atomically PENDING → READY — only one thread succeeds
+        TaskNode::State expected = TaskNode::State::PENDING;
+        if (!node->state.compare_exchange_strong(
+                expected, TaskNode::State::READY)) {
+            return;  // another thread already activated it
+        }
+        
+        pending_tasks.fetch_add(1);
+        pool.submit([this, node]() {
+            // mark RUNNING
+            node->state.store(TaskNode::State::RUNNING);
+            cout << "  Running: " << node->name << "\n";
+
+            auto task_start = chrono::steady_clock::now();
+            // execute work
+            exception_ptr ex = nullptr;
+            try {
+                node->work();
+            } catch (...) {
+                ex = current_exception();
+                cerr << " Exception in task: "
+                     << node->name << "\n";
+            }
+
+            auto ms = chrono::duration_cast<chrono::milliseconds>
+                      (chrono::steady_clock::now() - task_start).count();
+            cout << "  Done:    " << node->name
+                 << " (" << ms << "ms)\n";
+
+            // mark DONE and fulfill promise
+            node->state.store(TaskNode::State::DONE);
+            node->fulfill(ex);
+
+            // notify dependents — the cascade
+            for (TaskNode* dependent : node->dependents) {
+                // fetch_sub returns OLD value
+                int old = dependent->dep_count.fetch_sub(1);
+                if (old == 1) {
+                    // WE are the last dependency — activate it
+                    // exactly ONE thread ever sees old==1 ✅
+                    activate(dependent);
+                }
+            }
+
+            pending_tasks.fetch_sub(1);
+            all_done_cv.notify_all();
+
+        }, node->priority);
+    }
+
+public:
+    explicit DAGScheduler(ThreadPool& p) : pool(p) {}
+    // ── Add Task ─────────────────────────────────────────────────
+    TaskNode* add_task(string name,
+                       function<void()> work,
+                       Priority priority = Priority::NORMAL)
+    {
+        lock_guard<mutex> lock(graph_m);
+        auto node = make_unique<TaskNode>(
+            std::move(name), std::move(work), priority
+        );
+        node->id = node_id_counter.fetch_add(1);
+        nodes.push_back(std::move(node));
+        return nodes.back().get();
+    }
+    
+    // ── Add Dependency ───────────────────────────────────────────
+    // "dependent cannot run until dependency finishes"
+    // usage: add_dependency(B, A) means A ──► B
+    void add_dependency(TaskNode* dependent, TaskNode* dependency) {
+        lock_guard<mutex> lock(graph_m);
+        dependent->dep_count.fetch_add(1);
+        dependency->dependents.push_back(dependent);
+    }
+
+    // ── Execute Graph ────────────────────────────────────────────
+    void execute() {
+        if (!validate())
+            throw runtime_error("DAG contains a cycle");
+
+        cout << "\n Graph has " << nodes.size() << " tasks\n\n";
+
+        // activate all root nodes (no dependencies)
+        for (auto& node : nodes) {
+            if (node->dep_count.load() == 0) {
+                cout << "  Root: " << node->name << "\n";
+                activate(node.get());
+            }
+        }
+    }
+
+    // ── Wait For All ─────────────────────────────────────────────
+    void wait_all() {
+        unique_lock<mutex> lock(wait_m);
+        all_done_cv.wait(lock, [this] {
+            return pending_tasks.load() == 0;
+        });
+    }
+
+    // ── Wait For Specific Task ───────────────────────────────────
+    void wait(TaskNode* node) {
+        node->completion_future.get();
+    }
+
+    // ── Print Graph Structure ────────────────────────────────────
+    void print_graph() {
+        cout << "\n DAG Structure:\n";
+        for (auto& node : nodes) {
+            cout << "  [" << node->name << "]";
+            if (!node->dependents.empty()) {
+                cout << " ──► ";
+                for (int i = 0; i < (int)node->dependents.size(); i++) {
+                    if (i > 0) cout << ", ";
+                    cout << node->dependents[i]->name;
+                }
+            }
+            cout << "\n";
+        }
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Test 1: Linear Chain A → B → C → D ──────────────────────────
+void test_linear_chain() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST 1: Linear Chain A→B→C→D       ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    ThreadPool pool(4);
+    DAGScheduler dag(pool);
+
+    atomic<int> order{0};
+    vector<int> execution_order;
+    mutex order_m;
+
+    auto A = dag.add_task("A", [&]() {
+        this_thread::sleep_for(chrono::milliseconds(10));
+        lock_guard<mutex> lock(order_m);
+        execution_order.push_back(order.fetch_add(1));
+    });
+    auto B = dag.add_task("B", [&]() {
+        lock_guard<mutex> lock(order_m);
+        execution_order.push_back(order.fetch_add(1));
+    });
+    auto C = dag.add_task("C", [&]() {
+        lock_guard<mutex> lock(order_m);
+        execution_order.push_back(order.fetch_add(1));
+    });
+    auto D = dag.add_task("D", [&]() {
+        lock_guard<mutex> lock(order_m);
+        execution_order.push_back(order.fetch_add(1));
+    });
+
+    // A → B → C → D
+    dag.add_dependency(B, A);
+    dag.add_dependency(C, B);
+    dag.add_dependency(D, C);
+
+    dag.print_graph();
+    dag.execute();
+    dag.wait_all();
+
+    // verify sequential ordering
+    assert(execution_order == vector<int>({0,1,2,3}));
+    cout << "✅ Linear chain executed in correct order\n";
+
+    pool.shutdown();
+}
+
+// ── Test 2: Diamond A → B,C → D ─────────────────────────────────
+void test_diamond() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST 2: Diamond A→B,C→D            ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    ThreadPool pool(4);
+    DAGScheduler dag(pool);
+
+    atomic<bool> a_done{false};
+    atomic<bool> b_done{false};
+    atomic<bool> c_done{false};
+    atomic<int>  d_run_count{0};  // must be exactly 1
+
+    auto A = dag.add_task("A", [&]() {
+        this_thread::sleep_for(chrono::milliseconds(20));
+        a_done.store(true);
+    }, Priority::HIGH);
+
+    auto B = dag.add_task("B", [&]() {
+        assert(a_done.load()); // A must be done
+        this_thread::sleep_for(chrono::milliseconds(10));
+        b_done.store(true);
+    });
+
+    auto C = dag.add_task("C", [&]() {
+        assert(a_done.load()); // A must be done
+        this_thread::sleep_for(chrono::milliseconds(15));
+        c_done.store(true);
+    });
+
+    auto D = dag.add_task("D", [&]() {
+        assert(b_done.load()); // B must be done
+        assert(c_done.load()); // C must be done
+        d_run_count.fetch_add(1);
+    }, Priority::HIGH);
+
+    //   A
+    //  / \
+    // B   C
+    //  \ /
+    //   D
+    dag.add_dependency(B, A);
+    dag.add_dependency(C, A);
+    dag.add_dependency(D, B);
+    dag.add_dependency(D, C);
+
+    dag.print_graph();
+    dag.execute();
+    dag.wait_all();
+
+    assert(d_run_count.load() == 1);  // D runs EXACTLY once
+    cout << "Diamond executed correctly\n";
+    cout << "D ran exactly " << d_run_count << " time\n";
+
+    pool.shutdown();
+}
+
+// ── Test 3: Wide Fan-out A → B,C,D,E,F ──────────────────────────
+void test_fan_out() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST 3: Fan-Out A→B,C,D,E,F        ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    ThreadPool pool(4);
+    DAGScheduler dag(pool);
+
+    atomic<bool> a_done{false};
+    atomic<int>  children_done{0};
+
+    auto A = dag.add_task("A", [&]() {
+        this_thread::sleep_for(chrono::milliseconds(10));
+        a_done.store(true);
+    }, Priority::HIGH);
+
+    vector<TaskNode*> children;
+    for (char c = 'B'; c <= 'F'; c++) {
+        children.push_back(dag.add_task(string(1,c), [&]() {
+            assert(a_done.load());  // A must be done
+            children_done.fetch_add(1);
+        }));
+        dag.add_dependency(children.back(), A);
+    }
+
+    dag.print_graph();
+    dag.execute();
+    dag.wait_all();
+
+    assert(children_done.load() == 5);
+    cout << " All " << children_done
+         << " children ran after A completed\n";
+
+    pool.shutdown();
+}
+
+// ── Test 4: Complex Pipeline (like a build system) ───────────────
+void test_build_pipeline() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST 4: Build Pipeline              ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    ThreadPool pool(4);
+    DAGScheduler dag(pool);
+
+    //  compile_A ──► link_A ──┐
+    //  compile_B ──► link_B ──┼──► link_final ──► package
+    //  compile_C ──► link_C ──┘
+
+    auto compile_A = dag.add_task("compile_A", []{
+        this_thread::sleep_for(chrono::milliseconds(20));
+        cout << "    [compiled A.cpp]\n";
+    });
+    auto compile_B = dag.add_task("compile_B", []{
+        this_thread::sleep_for(chrono::milliseconds(15));
+        cout << "    [compiled B.cpp]\n";
+    });
+    auto compile_C = dag.add_task("compile_C", []{
+        this_thread::sleep_for(chrono::milliseconds(25));
+        cout << "    [compiled C.cpp]\n";
+    });
+
+    auto link_A = dag.add_task("link_A", []{
+        cout << "    [linked A.o]\n";
+    });
+    auto link_B = dag.add_task("link_B", []{
+        cout << "    [linked B.o]\n";
+    });
+    auto link_C = dag.add_task("link_C", []{
+        cout << "    [linked C.o]\n";
+    });
+
+    auto link_final = dag.add_task("link_final", []{
+        this_thread::sleep_for(chrono::milliseconds(10));
+        cout << "    [linked final binary]\n";
+    }, Priority::HIGH);
+
+    auto package = dag.add_task("package", []{
+        cout << "    [packaged release]\n";
+    }, Priority::HIGH);
+
+    // compile → link (per file)
+    dag.add_dependency(link_A, compile_A);
+    dag.add_dependency(link_B, compile_B);
+    dag.add_dependency(link_C, compile_C);
+
+    // all links → final link
+    dag.add_dependency(link_final, link_A);
+    dag.add_dependency(link_final, link_B);
+    dag.add_dependency(link_final, link_C);
+
+    // final link → package
+    dag.add_dependency(package, link_final);
+
+    dag.print_graph();
+
+    auto start = chrono::steady_clock::now();
+    dag.execute();
+    dag.wait_all();
+    auto ms = chrono::duration_cast<chrono::milliseconds>
+              (chrono::steady_clock::now() - start).count();
+
+    cout << "Build pipeline complete in " << ms << "ms\n";
+    // compiles run in parallel — should be ~25ms not 60ms
+    cout << "   (sequential would take ~60ms, parallel took "
+         << ms << "ms)\n";
+
+    pool.shutdown();
+}
+
+// ── Test 5: Cycle Detection ──────────────────────────────────────
+void test_cycle_detection() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST 5: Cycle Detection             ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    ThreadPool pool(4);
+    DAGScheduler dag(pool);
+
+    auto A = dag.add_task("A", []{});
+    auto B = dag.add_task("B", []{});
+    auto C = dag.add_task("C", []{});
+
+    // create a cycle: A → B → C → A
+    dag.add_dependency(B, A);
+    dag.add_dependency(C, B);
+    dag.add_dependency(A, C);  // ← creates cycle
+
+    try {
+        dag.execute();
+        cerr << "Should have thrown!\n";
+    } catch (runtime_error& e) {
+        cout << "Cycle correctly detected: "
+             << e.what() << "\n";
+    }
+
+    pool.shutdown();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN
+// ═══════════════════════════════════════════════════════════════════
+
+int main() {
+    cout << "╔══════════════════════════════════════╗\n";
+    cout << "║      DAG SCHEDULER TEST SUITE        ║\n";
+    cout << "╚══════════════════════════════════════╝\n";
+
+    test_linear_chain();
+    test_diamond();
+    test_fan_out();
+    test_build_pipeline();
+    test_cycle_detection();
+
+    cout << "\n✅ All DAG tests complete\n";
+    return 0;
+}
+
+/*
 
 // ═══════════════════════════════════════════════════════════════════
 //  PHASE 1 — CORRECTNESS TESTS
@@ -832,3 +1272,4 @@ int main() {
     cout << "\n All validation phases complete\n";
     return 0;
 }
+    */
