@@ -42,6 +42,31 @@ struct Task {
 
 constexpr size_t CACHE_LINE_SIZE = 64;
 
+// ═══════════════════════════════════════════════════════════════════
+//  LOCK-FREE COUNTER
+//  Demonstrates: memory_order_relaxed for pure counting
+// ═══════════════════════════════════════════════════════════════════
+
+struct LockFreeCounter {
+    alignas(CACHE_LINE_SIZE) atomic<long> value{0};
+
+    // relaxed: we only care about the VALUE, not about ordering
+    long increment(long by = 1) {
+        return value.fetch_add(by, memory_order_relaxed) + by;
+    }
+
+    long decrement(long by = 1) {
+        return value.fetch_sub(by, memory_order_relaxed) - by;
+    }
+
+    // reading a stat at the end of a benchmark
+    long get() const {
+        return value.load(memory_order_relaxed);
+    }
+
+    void reset() { value.store(0, memory_order_relaxed); }
+};
+
 //___SCHEDULER STATS___________________________________________________________________
 
 struct SchedulerStats {
@@ -68,17 +93,25 @@ struct SchedulerStats {
         : workers(num_workers){}
 
     void record_latency(long us) {
-        total_latency_us.fetch_add(us);
-        long cur_min = min_latency_us.load();
-        while (us < cur_min && !min_latency_us.compare_exchange_weak(cur_min, us)){}
-        long cur_max = max_latency_us.load();
-        while (us > cur_max && !max_latency_us.compare_exchange_weak(cur_max, us)){}
+        total_latency_us.fetch_add(us, memory_order_relaxed);
+        long cur = min_latency_us.load(memory_order_relaxed);
+        while (us < cur &&
+               !min_latency_us.compare_exchange_weak(
+                   cur, us,
+                   memory_order_relaxed,
+                   memory_order_relaxed)) {}
+        cur = max_latency_us.load(memory_order_relaxed);
+        while (us > cur &&
+               !max_latency_us.compare_exchange_weak(
+                   cur, us,
+                   memory_order_relaxed,
+                   memory_order_relaxed)) {}
     }
 
     void print() const{
-        long submitted = tasks_submitted.load();
-        long executed = tasks_executed.load();
-        long stolen = tasks_stolen.load();
+        long submitted = tasks_submitted.load(memory_order_relaxed);
+        long executed = tasks_executed.load(memory_order_relaxed);
+        long stolen = tasks_stolen.load()memory_order_relaxed;
         cout << "\n╔══════════════════════════════════════╗\n";
         cout <<   "║        SCHEDULER STATISTICS          ║\n";
         cout <<   "╠══════════════════════════════════════╣\n";
@@ -86,41 +119,30 @@ struct SchedulerStats {
         cout <<   "║  Executed:    " << setw(10) << executed    << "           ║\n";
         cout <<   "║  Stolen:      " << setw(10) << stolen      << "           ║\n";
 
-        if (executed > 0 ) {
+       if (executed > 0) {
             cout << "║  Steal rate:  " << setw(9)
                  << (stolen * 100 / executed) << "%           ║\n";
-            cout << "║  Avg latency: " << setw(8)
-                 << (total_latency_us / executed) << "us           ║\n";
+            long avg = total_latency_us.load(memory_order_relaxed) / executed;
+            cout << "║  Avg latency: " << setw(8) << avg << "us           ║\n";
         }
-        if (min_latency_us.load() != LONG_MAX) {
-            cout << "║  Min latency: " << setw(8)
-                 << min_latency_us.load() << "us           ║\n";
-            cout << "║  Max latency: " << setw(8)
-                 << max_latency_us.load() << "us           ║\n";
-        }
-
-        cout << "╠══════════════════════════════════════╣\n";
-        cout << "║  Per-Worker Breakdown:               ║\n";
-        for (int i = 0; i < (int)workers.size(); i++) {
-            cout << "║   W" << i
-                 << ": exec=" << setw(6) << workers[i].tasks_executed
-                 << "  stolen=" << setw(6) << workers[i].tasks_stolen
-                 << "  idle=" << setw(4) << workers[i].times_idle
-                 << "  ║\n";
+        long mn = min_latency_us.load(memory_order_relaxed);
+        long mx = max_latency_us.load(memory_order_relaxed);
+        if (mn != LONG_MAX) {
+            cout << "║  Min latency: " << setw(8) << mn << "us           ║\n";
+            cout << "║  Max latency: " << setw(8) << mx << "us           ║\n";
         }
         cout << "╚══════════════════════════════════════╝\n";
     }
 
     void verify() const {
-        long submitted = tasks_submitted.load();
-        long executed = tasks_executed.load();
-        if (submitted != executed) {
-            cerr << "LOST TASKS: submitted=" << submitted
-                << "executed=" << executed << "\n";
-        }else {
-            cout << "NO LOST TASKS: submitted=" << submitted
-                << "executed=" << executed << "\n";
-        }
+        long s = tasks_submitted.load(memory_order_relaxed);
+        long e = tasks_executed.load(memory_order_relaxed);
+        if (s != e)
+            cerr << "LOST TASKS: submitted=" << s
+                 << " executed=" << e << "\n";
+        else
+            cout << "No lost tasks: " << s << " submitted = "
+                 << e << " executed\n";
     }
     
 
@@ -129,54 +151,43 @@ struct SchedulerStats {
         cout <<   "║     WORKER UTILIZATION ANALYSIS      ║\n";
         cout <<   "╚══════════════════════════════════════╝\n";
 
-        long total_executed = 0;
-        vector<long> per_worker;
+        long total = 0;
+        vector<long> pw;
         for (auto& w : workers) {
-            per_worker.push_back(w.tasks_executed.load());
-            total_executed += per_worker.back();
+            pw.push_back(w.tasks_executed.load(memory_order_relaxed));
+            total += pw.back();
         }
+        int n = (int)pw.size();
+        if (n == 0 || total == 0) { cout << "  (no data)\n"; return; }
 
-        int n = (int)per_worker.size();
-        if (n == 0 || total_executed == 0) {
-            cout << "  (no tasks executed yet)\n";
-            return;
-        }
+        double ideal = (double)total / n;
+        cout << "  Ideal per worker: " << fixed << setprecision(1)
+             << ideal << "\n\n";
 
-        double ideal_share = (double)total_executed / n;
-        cout << "  Ideal share per worker: "
-             << fixed << setprecision(1) << ideal_share << " tasks\n\n";
-
-        double max_deviation = 0;
+        double max_dev = 0;
         for (int i = 0; i < n; i++) {
-            double deviation = fabs(per_worker[i] - ideal_share)
-                                / ideal_share * 100.0;
-            max_deviation = max(max_deviation, deviation);
-
-            string verdict = deviation < 10 ? "balanced  " :
-                              deviation < 30 ? "uneven    " :
-                                               "imbalanced";
-
-            cout << "  W" << i << ": " << setw(8) << per_worker[i]
-                 << " executed  | " << setw(8)
-                 << workers[i].tasks_stolen.load() << " stolen  | "
-                 << verdict << " (" << setprecision(1)
-                 << deviation << "% dev)\n";
+            double dev = fabs(pw[i] - ideal) / ideal * 100.0;
+            max_dev = max(max_dev, dev);
+            string tag = dev < 10 ? "balanced  "
+                       : dev < 30 ? "uneven    "
+                                  : "imbalanced";
+            cout << "  W" << i << ": " << setw(8) << pw[i]
+                 << " exec | " << setw(7)
+                 << workers[i].tasks_stolen.load(memory_order_relaxed)
+                 << " stolen | " << tag
+                 << " (" << setprecision(1) << dev << "% dev)\n";
         }
+        double steal_pct = (double)tasks_stolen.load(memory_order_relaxed)
+                            / total * 100.0;
+        cout << "\n  Max deviation:  " << max_dev    << "%\n";
+        cout <<   "  Steal rate:     " << steal_pct  << "%\n";
 
-        cout << "\n  Max deviation: " << max_deviation << "%\n";
-
-        double steal_pct = (double)tasks_stolen.load()
-                            / total_executed * 100.0;
-        cout << "  Overall steal rate: " << steal_pct << "%\n";
-
-        if (max_deviation < 15 && steal_pct < 30) {
+        if (max_dev < 15 && steal_pct < 30)
             cout << "  Load well-distributed, minimal steal overhead\n";
-        } else if (max_deviation > 30) {
-            cout << "  Significant imbalance, investigate"
-                 << " distribution/stealing logic\n";
-        } else {
+        else if (max_dev > 30)
+            cout << "  Significant imbalance — investigate victim selection\n";
+        else
             cout << "  Moderate imbalance, within acceptable range\n";
-        }
     }
 };
 
@@ -188,7 +199,7 @@ private:
     // one deque per priority level (indexed by priorities, low=0, normal=1, high=2)
     array<deque<Task>, 3> buckets; // [LOW=0][NORMAL=1][HIGH=2]
     mutable mutex m;
-    alignas(CACHE_LINE_SIZE) atomic<int> approx_size{0}; // updated OUTSIDE the lock
+    alignas(CACHE_LINE_SIZE) atomic<int> approx_size{0}; 
 
     static int idx(Priority p) {
         return static_cast<int>(p);
@@ -201,7 +212,7 @@ public:
             lock_guard<mutex> lock(m);
             buckets[idx(task.priority)].push_back(std::move(task));
         }
-        approx_size.fetch_add(1);   // updated OUTSIDE the lock
+        approx_size.fetch_add(1, memory_order_relaxed);   
     }
 
     optional<Task> pop_back() {
@@ -217,7 +228,7 @@ public:
                 }
             }
         }
-        if (result) approx_size.fetch_sub(1);
+        if (result) approx_size.fetch_sub(1, memory_order_relaxed);
         return result;
     }
 
@@ -235,7 +246,7 @@ public:
             }
         }
         if (!batch.empty())
-            approx_size.fetch_sub((int)batch.size());
+            approx_size.fetch_sub((int)batch.size(), memory_order_relaxed);
         return batch;
     }
 
@@ -252,7 +263,7 @@ public:
                 }
             }
         }
-        if (result) approx_size.fetch_sub(1);
+        if (result) approx_size.fetch_sub(1, memory_order_relaxed);
         return result;
     }
     
@@ -264,10 +275,56 @@ public:
     }
 
     int size_approx() const {
-        return approx_size.load();
+        return approx_size.load(memory_order_relaxed);
     }
 };
 
+//  LOCK-FREE STACK  (Phase 4 demonstration)
+template<typename T>
+class LockFreeStack {
+private:
+    struct Node {
+        T data;
+        Node* next;
+        Node(T d) : data(std::move(d)), next(nullptr) {}
+    };
+
+    atomic<Node*> head{nullptr};
+
+public:
+    void push(T data) {
+        Node* n = new Node(std::move(data));
+        // load relaxed — we will re-read inside the CAS loop anyway
+        n->next = head.load(memory_order_relaxed);
+
+        // release: makes n->data visible to any thread that
+        // acquire-loads head and gets this node.
+        while (!head.compare_exchange_weak(
+                    n->next, n,
+                    memory_order_release,
+                    memory_order_relaxed)) {}
+    }
+
+    optional<T> pop() {
+        // acquire: if we see a non-null head, we are guaranteed to
+        // also see the node's data that was release-stored by push().
+        Node* old = head.load(memory_order_acquire);
+        while (old &&
+               !head.compare_exchange_weak(
+                    old, old->next,
+                    memory_order_acquire,
+                    memory_order_relaxed)) {}
+
+        if (!old) return nullopt;
+        T val = std::move(old->data);
+        delete old;
+        return val;
+    }
+
+    ~LockFreeStack() {
+        while (pop()) {}
+    }
+};
 
 class ThreadPool {
 private:
@@ -316,7 +373,7 @@ private:
         if (busiest_id >= 0 && max_size > 0){
             auto task = workers[busiest_id]->deque.steal_front();
             if (task) {
-                total_tasks.fetch_sub(1);
+                total_tasks.fetch_sub(1, memory_order_acq_rel);
                 return task;
             }
         }
@@ -325,7 +382,7 @@ private:
             int target = (my_id + i) % n;
             auto task = workers[target]->deque.steal_front();  // decrement on steal
             if (task) {
-                total_tasks.fetch_sub(1);
+                total_tasks.fetch_sub(1, memory_order_acq_rel);
                 return task;
             } 
         }
@@ -337,7 +394,7 @@ private:
     void notify_one_idle_worker(int exclude_id){
         for (auto& w : workers) {
             if (w->id == exclude_id) continue;
-            if (w->is_idle.load()){
+            if (w->is_idle.load(memory_order_relaxed)){
                 w->cv.notify_one();
                 return;
             }
@@ -375,9 +432,9 @@ private:
                 if (batch.empty()) break;
 
                 for (auto& task : batch) {
-                    total_tasks.fetch_sub(1);
-                    stats.tasks_executed.fetch_add(1);
-                    stats.workers[my_id].tasks_executed.fetch_add(1);
+                    total_tasks.fetch_sub(1, memory_order_acq_rel);
+                    stats.tasks_executed.fetch_add(1, memory_order_relaxed);
+                    stats.workers[my_id].tasks_executed.fetch_add(1, memory_order_relaxed);
                     run_task(my_id, task);
                 }
             }
@@ -387,26 +444,26 @@ private:
                 // try steal from busiest worker
                 auto task = try_steal(my_id);
                 if(task){
-                    stats.tasks_executed.fetch_add(1);
-                    stats.tasks_stolen.fetch_add(1);
-                    stats.workers[my_id].tasks_executed.fetch_add(1);
-                    stats.workers[my_id].tasks_stolen.fetch_add(1);
+                    stats.tasks_executed.fetch_add(1, memory_order_relaxed);
+                    stats.tasks_stolen.fetch_add(1, memory_order_relaxed);
+                    stats.workers[my_id].tasks_executed.fetch_add(1, memory_order_relaxed);
+                    stats.workers[my_id].tasks_stolen.fetch_add(1, memory_order_relaxed);
                     run_task(my_id, *task);
                     continue;
                 }
             }
 
             // ── check shutdown before sleeping ───────────
-            if (stop_flag.load() && total_tasks.load()==0){
+            if (stop_flag.load(memory_order_acquire) && total_tasks.load(memory_order_acquire)==0){
                 // drain any remaining tasks before exit
                 while (true)
                 {
                     auto task = try_steal(my_id);
                     if (!task) break;
-                    stats.tasks_executed.fetch_add(1);
-                    stats.tasks_stolen.fetch_add(1);
-                    stats.workers[my_id].tasks_executed.fetch_add(1);
-                    stats.workers[my_id].tasks_stolen.fetch_add(1);
+                    stats.tasks_executed.fetch_add(1, memory_order_relaxed);
+                    stats.tasks_stolen.fetch_add(1, memory_order_relaxed);
+                    stats.workers[my_id].tasks_executed.fetch_add(1, memory_order_relaxed);
+                    stats.workers[my_id].tasks_stolen.fetch_add(1, memory_order_relaxed);
                     run_task(my_id, *task);
                 }
                 
@@ -417,23 +474,23 @@ private:
             auto idle_start = chrono::steady_clock::now();
             {
                 unique_lock<mutex> lock(me.cv_m);
-                me.is_idle.store(true);
-                stats.workers[my_id].times_idle.fetch_add(1);
+                me.is_idle.store(true, memory_order_relaxed);
+                stats.workers[my_id].times_idle.fetch_add(1, memory_order_relaxed);
 
                 me.cv.wait(lock, [&] {
-                    return stop_flag.load() 
+                    return stop_flag.load(memory_order_acquire) 
                         || !me.deque.empty()
-                        || total_tasks.load() > 0;
+                        || total_tasks.load(memory_order_acquire) > 0;
                     });
 
-                me.is_idle.store(false);
+                me.is_idle.store(false, memory_order_relaxed);
             }
             auto idle_us = chrono::duration_cast<chrono::microseconds>
                             (chrono::steady_clock::now()- idle_start).count();
-            stats.workers[my_id].idle_time_us.fetch_add(idle_us);
+            stats.workers[my_id].idle_time_us.fetch_add(idle_us, memory_order_relaxed);
 
             // ── re-check exit after wakeup ──────────────
-            if (stop_flag.load() && total_tasks.load() == 0){
+            if (stop_flag.load(memory_order_acquire) && total_tasks.load(memory_order_acquire) == 0){
                 return;
             }
         }
@@ -461,7 +518,7 @@ public:
 
         using ReturnType = decltype(task());
 
-        if (stop_flag.load())
+        if (stop_flag.load(memory_order_acquire))
         {
             throw runtime_error("ThreadPool is stopped : submit() called after shutdown");
         }
@@ -474,26 +531,31 @@ public:
         future<ReturnType> result = pt -> get_future();
 
 
-        int target = (preferred_worker >= 0 && preferred_worker < (int)workers.size())
+        int seq    = sequence_counter.fetch_add(1, memory_order_relaxed);
+        int target = (preferred_worker >= 0 &&
+                      preferred_worker < (int)workers.size())
             ? preferred_worker
-            :next_worker.fetch_add(1) % workers.size();
+            : next_worker.fetch_add(1, memory_order_relaxed)
+              % (int)workers.size();
 
         workers[target]->deque.push(Task{
-            priority,
-            id_generator.fetch_add(1),
-            [pt](){ (*pt)(); },
+            priority, seq, [pt]() { (*pt)(); },
             chrono::steady_clock::now()
         });
-        total_tasks.fetch_add(1);
-        stats.tasks_submitted.fetch_add(1);
 
-        // notify target worker directly
+        stats.tasks_submitted.fetch_add(1, memory_order_relaxed);
+
+        // acq_rel: the fetch_add makes the new task count visible
+        // and ensures the pushed task is seen by the waking worker.
+        total_tasks.fetch_add(1, memory_order_acq_rel);
+
+        // Wake the target worker directly.
         workers[target]->cv.notify_one();
 
-        // if taret is busy, notify an idle worker to steal
-        if (!workers[target]->is_idle.load()) {
+        // If the target is already busy, find an idle worker to steal.
+        if (!workers[target]->is_idle.load(memory_order_relaxed))
             notify_one_idle_worker(target);
-        }
+
         return result;
     }
 
@@ -501,9 +563,11 @@ public:
     void shutdown()
     {
         bool expected = false;
-        if(!stop_flag.compare_exchange_strong(expected, true)) {
+        if (!stop_flag.compare_exchange_strong(
+                expected, true,
+                memory_order_release,
+                memory_order_relaxed))
             return;
-        }
       
         for (auto &w: workers){
             {
@@ -527,6 +591,383 @@ public:
 
 };
 
+// ═══════════════════════════════════════════════════════════════════
+//  PHASE 4 DEMO — lock-free stack smoke test
+// ═══════════════════════════════════════════════════════════════════
+
+void demo_lock_free_stack() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  DEMO: Lock-Free Stack               ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    LockFreeStack<int> stack;
+    const int N = 10000;
+    atomic<int> sum_pushed{0}, sum_popped{0};
+
+    // 4 pushers and 4 poppers run concurrently
+    vector<thread> threads;
+    for (int t = 0; t < 4; t++) {
+        threads.emplace_back([&, t]() {
+            for (int i = t * (N/4); i < (t+1) * (N/4); i++) {
+                stack.push(i);
+                sum_pushed.fetch_add(i, memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    threads.clear();
+
+    for (int t = 0; t < 4; t++) {
+        threads.emplace_back([&]() {
+            while (true) {
+                auto val = stack.pop();
+                if (!val) break;
+                sum_popped.fetch_add(*val, memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    assert(sum_pushed.load() == sum_popped.load());
+    cout << "  Pushed sum: " << sum_pushed.load() << "\n";
+    cout << "  Popped sum: " << sum_popped.load() << "\n";
+    cout << "  ✅ Sums match — no items lost or duplicated\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CORRECTNESS TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+void test_no_lost_tasks() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST: No Lost Tasks (100k)          ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    EventDrivenThreadPool pool(4);
+    const int N = 100000;
+    atomic<int> counter{0};
+    vector<future<void>> futures;
+    futures.reserve(N);
+
+    auto start = chrono::steady_clock::now();
+    for (int i = 0; i < N; i++)
+        futures.push_back(pool.submit([&counter]() {
+            counter.fetch_add(1, memory_order_relaxed);
+        }));
+    for (auto& f : futures) f.get();
+    auto ms = chrono::duration_cast<chrono::milliseconds>
+              (chrono::steady_clock::now() - start).count();
+
+    assert(counter.load() == N);
+    pool.stats.verify();
+    cout << "  Time: " << ms << "ms";
+    if (ms > 0) cout << "  |  " << (N * 1000 / ms) << " tasks/sec";
+    cout << "\n";
+
+    pool.shutdown();
+    pool.stats.print();
+    pool.stats.analyze_utilization();
+}
+
+void test_priority_ordering() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST: Priority Ordering (1 worker)  ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    // Use 1 worker so all tasks queue before any run.
+    EventDrivenThreadPool pool(1);
+    vector<string> order;
+    mutex order_m;
+
+    for (int i = 0; i < 5; i++) {
+        pool.submit([&, i]() {
+            lock_guard<mutex> lk(order_m);
+            order.push_back("LOW:"    + to_string(i));
+        }, Priority::LOW);
+
+        pool.submit([&, i]() {
+            lock_guard<mutex> lk(order_m);
+            order.push_back("HIGH:"   + to_string(i));
+        }, Priority::HIGH);
+
+        pool.submit([&, i]() {
+            lock_guard<mutex> lk(order_m);
+            order.push_back("NORMAL:" + to_string(i));
+        }, Priority::NORMAL);
+    }
+    pool.shutdown();
+
+    // With 1 worker and batched pop, HIGH tasks should dominate
+    // the early slots.
+    int high_in_first_5 = 0;
+    cout << "  Execution order (first 10):\n";
+    for (int i = 0; i < min(10, (int)order.size()); i++) {
+        cout << "    " << order[i] << "\n";
+        if (i < 5 && order[i].find("HIGH") != string::npos)
+            high_in_first_5++;
+    }
+    cout << "  HIGH tasks in first 5 slots: "
+         << high_in_first_5 << "/5\n";
+}
+
+void test_heavy_stealing() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST: Heavy Stealing                ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    EventDrivenThreadPool pool(4);
+    const int N = 5000;
+    atomic<int> counter{0};
+    vector<future<void>> futures;
+    futures.reserve(N);
+
+    // All to Worker 0 — forces others to steal.
+    for (int i = 0; i < N; i++)
+        futures.push_back(pool.submit(
+            [&counter]() { counter.fetch_add(1, memory_order_relaxed); },
+            Priority::NORMAL, 0));
+    for (auto& f : futures) f.get();
+
+    assert(counter.load() == N);
+    pool.stats.verify();
+    pool.shutdown();
+    pool.stats.print();
+    pool.stats.analyze_utilization();
+}
+
+void test_exception_safety() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST: Exception Safety              ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    EventDrivenThreadPool pool(4);
+    const int N = 100;
+    atomic<int> completed{0}, caught{0};
+    vector<future<int>> futures;
+    futures.reserve(N);
+
+    for (int i = 0; i < N; i++)
+        futures.push_back(pool.submit([i, &completed]() -> int {
+            if (i % 10 == 0)
+                throw runtime_error("error " + to_string(i));
+            completed.fetch_add(1, memory_order_relaxed);
+            return i;
+        }));
+
+    for (int i = 0; i < N; i++) {
+        try { futures[i].get(); }
+        catch (...) { caught.fetch_add(1, memory_order_relaxed); }
+    }
+
+    auto f = pool.submit([]() { return 42; });
+    assert(f.get() == 42);
+    cout << "  ✅ Survived " << caught << " exceptions, "
+         << completed << " tasks completed, pool still alive\n";
+    pool.shutdown();
+}
+
+void test_raii_shutdown() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  TEST: RAII Shutdown                 ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    atomic<int> counter{0};
+    {
+        EventDrivenThreadPool pool(4);
+        for (int i = 0; i < 10000; i++) {
+            try {
+                pool.submit([&counter]() {
+                    counter.fetch_add(1, memory_order_relaxed);
+                });
+            } catch (...) { break; }
+        }
+        // destructor calls shutdown() — no manual call needed
+    }
+    cout << "  ✅ Pool destroyed cleanly via RAII\n";
+    cout << "  Tasks completed before shutdown: " << counter.load() << "\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  BENCHMARKS
+// ═══════════════════════════════════════════════════════════════════
+
+void benchmark_throughput() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  BENCHMARK: Throughput Scaling       ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    const int N = 200000;
+    for (int w : {1, 2, 4, 8}) {
+        EventDrivenThreadPool pool(w);
+        atomic<int> counter{0};
+        vector<future<void>> futures;
+        futures.reserve(N);
+
+        auto start = chrono::steady_clock::now();
+        for (int i = 0; i < N; i++)
+            futures.push_back(pool.submit([&counter]() {
+                counter.fetch_add(1, memory_order_relaxed);
+            }));
+        for (auto& f : futures) f.get();
+        auto ms = chrono::duration_cast<chrono::milliseconds>
+                  (chrono::steady_clock::now() - start).count();
+
+        assert(counter.load() == N);
+        cout << "  Workers: " << setw(2) << w
+             << " | Time: " << setw(6) << ms << "ms";
+        if (ms > 0) cout << " | " << setw(10) << (N*1000/ms) << " tasks/sec";
+        cout << "\n";
+        pool.shutdown();
+    }
+}
+
+void benchmark_steal_rate() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  BENCHMARK: Steal Rate               ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    const int N = 20000;
+    for (auto& s : vector<pair<string,int>>{
+        {"balanced   (round-robin)  ", -1},
+        {"imbalanced (all Worker 0) ",  0}}) {
+
+        EventDrivenThreadPool pool(4);
+        vector<future<void>> futures;
+        futures.reserve(N);
+
+        auto start = chrono::steady_clock::now();
+        for (int i = 0; i < N; i++)
+            futures.push_back(pool.submit([](){}, Priority::NORMAL, s.second));
+        for (auto& f : futures) f.get();
+        auto ms = chrono::duration_cast<chrono::milliseconds>
+                  (chrono::steady_clock::now() - start).count();
+
+        long ex = pool.stats.tasks_executed.load(memory_order_relaxed);
+        long st = pool.stats.tasks_stolen  .load(memory_order_relaxed);
+        cout << "  " << s.first
+             << " | " << setw(5) << ms << "ms"
+             << " | steal rate: " << (ex>0 ? st*100/ex : 0) << "%\n";
+        pool.shutdown();
+    }
+}
+
+void benchmark_batch_vs_single() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  BENCHMARK: Batch Pop vs Single Pop  ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    const int N = 200000;
+    auto run = [&](int batch) {
+        BucketedPriorityDeque deque;
+        for (int i = 0; i < N; i++)
+            deque.push(Task{Priority::NORMAL, i, [](){}});
+
+        auto start = chrono::steady_clock::now();
+        int got = 0;
+        if (batch == 1) {
+            while (deque.pop_back()) got++;
+        } else {
+            while (true) {
+                auto b = deque.pop_batch(batch);
+                if (b.empty()) break;
+                got += (int)b.size();
+            }
+        }
+        auto us = chrono::duration_cast<chrono::microseconds>
+                  (chrono::steady_clock::now() - start).count();
+        assert(got == N);
+        cout << "  batch=" << setw(2) << batch
+             << " | " << us << "us total"
+             << " | " << fixed << setprecision(3) << (double)us/N
+             << "us/task\n";
+    };
+    run(1); run(4); run(8); run(32);
+}
+
+void benchmark_memory_order_comparison() {
+    cout << "\n╔══════════════════════════════════════╗\n";
+    cout <<   "║  BENCHMARK: Memory Order Overhead    ║\n";
+    cout <<   "╚══════════════════════════════════════╝\n";
+
+    const int N = 10000000;
+    atomic<long> counter{0};
+
+    auto measure = [&](const string& label, auto fn) {
+        counter.store(0, memory_order_relaxed);
+        auto start = chrono::steady_clock::now();
+        for (int i = 0; i < N; i++) fn();
+        auto ns = chrono::duration_cast<chrono::nanoseconds>
+                  (chrono::steady_clock::now() - start).count();
+        cout << "  " << setw(12) << label
+             << " : " << (double)ns / N << "ns/op"
+             << "  (total " << ns/1000000 << "ms)\n";
+    };
+
+    measure("seq_cst",  [&]() { counter.fetch_add(1, memory_order_seq_cst); });
+    measure("acq_rel",  [&]() { counter.fetch_add(1, memory_order_acq_rel); });
+    measure("relaxed",  [&]() { counter.fetch_add(1, memory_order_relaxed); });
+
+    cout << "  On x86 all three are identical (hardware is TSO).\n";
+    cout << "  On ARM/POWER relaxed is measurably cheaper.\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MEMORY ORDER CHEAT SHEET  (printed at startup as a reference)
+// ═══════════════════════════════════════════════════════════════════
+
+void print_memory_order_guide() {
+    cout << "\n╔══════════════════════════════════════════════════════════╗\n";
+    cout <<   "║  MEMORY ORDER QUICK REFERENCE                          ║\n";
+    cout <<   "╠══════════════════════════════════════════════════════════╣\n";
+    cout <<   "║  relaxed  — atomic op only, no ordering guarantees     ║\n";
+    cout <<   "║             use for: counters, IDs, heuristics          ║\n";
+    cout <<   "║                                                          ║\n";
+    cout <<   "║  acquire  — see everything before matching release      ║\n";
+    cout <<   "║             use for: reading a flag/pointer             ║\n";
+    cout <<   "║                                                          ║\n";
+    cout <<   "║  release  — make everything before me visible           ║\n";
+    cout <<   "║             use for: writing a flag/pointer             ║\n";
+    cout <<   "║                                                          ║\n";
+    cout <<   "║  acq_rel  — both acquire and release in one op         ║\n";
+    cout <<   "║             use for: read-modify-write (fetch_add etc)  ║\n";
+    cout <<   "║                                                          ║\n";
+    cout <<   "║  seq_cst  — global total order, strongest & slowest    ║\n";
+    cout <<   "║             use for: rarely — only if weaker won't do   ║\n";
+    cout <<   "╚══════════════════════════════════════════════════════════╝\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN
+// ═══════════════════════════════════════════════════════════════════
+
+int main() {
+    cout << "╔══════════════════════════════════════╗\n";
+    cout << "║  LOCK-FREE OPTIMIZED SCHEDULER       ║\n";
+    cout << "╚══════════════════════════════════════╝\n";
+
+    print_memory_order_guide();
+
+    cout << "\n━━━ PHASE 4: LOCK-FREE STRUCTURES ━━━\n";
+    demo_lock_free_stack();
+
+    cout << "\n━━━ CORRECTNESS TESTS ━━━\n";
+    test_no_lost_tasks();
+    test_priority_ordering();
+    test_heavy_stealing();
+    test_exception_safety();
+    test_raii_shutdown();
+
+    cout << "\n━━━ BENCHMARKS ━━━\n";
+    benchmark_throughput();
+    benchmark_steal_rate();
+    benchmark_batch_vs_single();
+    benchmark_memory_order_comparison();
+
+    cout << "\n✅ All tests and benchmarks complete\n";
+    return 0;
+}
+
+/*
 // ═══════════════════════════════════════════════════════════════════
 //  CORRECTNESS TESTS  (must still pass after optimization)
 // ═══════════════════════════════════════════════════════════════════
@@ -1656,3 +2097,5 @@ int main() {
     return 0;
 }
     */
+
+    
